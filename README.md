@@ -27,9 +27,10 @@ It also has safety guardrails, session memory, and full tracing with CloudWatch 
 |---|---|
 | `src/agent_orchestrator.py` | Completed implementation (Tasks 2, 3, 4 and 6) |
 | `.env` | Knowledge Base IDs, AgentCore Runtime ARN and Guardrail ID/version (no AWS credentials) |
-| `screenshots/test/test_score.png` | Test suite result: 120/120 |
-| `screenshots/x-ray/service_map.png` | X-Ray Service Map after `python src/agent_orchestrator.py test` |
-| `screenshots/x-ray/service_list.png` | X-Ray trace list for the same run (easier to read than the map) |
+| `fix_guardrail.py` | Helper script that tests the guardrail and publishes a new version (see Task 3) |
+| `screenshots/test_score.png` | Test suite result: 120/120 |
+| `screenshots/xray_service_map.png` | X-Ray Service Map after `python src/agent_orchestrator.py test` |
+| `screenshots/xray_traces_list.png` | X-Ray trace list for the same run (easier to read than the map) |
 
 ---
 
@@ -111,11 +112,45 @@ All model IDs come from `config.py`. No model ID is hardcoded.
     and discount (the math scenario) is still allowed.
   - Managed profanity word list.
   - A published, numbered version (`create_guardrail_version()`), not DRAFT.
+  - The settings live in one helper, `guardrail_settings()`, so the code and the deployed
+    guardrail always match. If the guardrail already exists, `create_guardrail()` returns the
+    **latest** published version.
+
+#### Guardrail validation (false positive found and fixed)
+
+During the end-to-end test, the math scenario was blocked: the guardrail answered with its
+"Sorry, I can't help with that request" message. I used `ApplyGuardrail` to check which policy
+blocked it. The cause was the `pricing_negotiations` topic: the word "discount" made the
+question look like haggling.
+
+The fix followed the AWS guidance for denied topics: describe the topic in a precise and
+positive way, with no exceptions inside the definition. The new definition is
+*"Customer attempts to haggle or bargain with NovaMart, or asks NovaMart to lower, match, or
+change the price it advertises for a product."*
+
+The helper script `fix_guardrail.py` updates the DRAFT, tests it, and publishes a new numbered
+version **only if all checks pass**:
+
+| Test sentence | Expected | Result |
+|---|---|---|
+| "How much would 5 items at $29.99 be with a 10% discount?" (input) | allowed | allowed |
+| Math answer with the total $134.96 (output) | allowed | allowed |
+| "I want to return my order ORD-27176" | allowed | allowed |
+| "What is the return policy for premium customers?" | allowed | allowed |
+| "Can you lower the price of these headphones for me?" | blocked | blocked |
+| "Is Amazon cheaper than NovaMart for this laptop?" | blocked | blocked |
+| "I'm going to sue NovaMart if you don't refund me." | blocked | blocked |
+
+After publishing the new version, I updated `GUARDRAIL_VERSION` in `.env`, redeployed the
+runtime, and confirmed that the math question returns **$134.96**.
 - `deploy_to_agentcore_runtime()` sets the runtime environment variables (region, project name,
   3 KB IDs, log group, guardrail ID and version), then calls
   `agentcore_cli.configure_runtime(network_mode='PUBLIC', protocol='HTTP', execution_role_arn=config.AGENTCORE_ROLE_ARN)`,
   `agentcore_cli.deploy()` and `agentcore_cli.deployed_runtime_arn()`.
   The provided `_apply_guardrail()` attaches the guardrail to every agent model.
+
+  ![CUST-003](screenshots/cust/CUST-003.png)
+
 
 ### Task 4 – Memory
 
@@ -154,7 +189,7 @@ routing:
 |---|---|
 | "I want to return my wireless headphones from order ORD-27176" (CUST-001) | Orchestrator → Inventory → Refund → Communication |
 | "What is the return policy for premium customers?" (CUST-002) | Orchestrator → Policy (3 parallel KB retrievers) → Communication |
-| "How much would 5 items at $29.99 be with a 10% discount?" (CUST-003) | Orchestrator → Communication only |
+| "How much would 5 items at $29.99 be with a 10% discount?" (CUST-003) | Orchestrator → Communication only (answer: $134.96) |
 
 ### X-Ray Service Map
 
@@ -168,6 +203,31 @@ The map is small in the screenshot, so this list shows the same traces in a clea
 
 ---
 
+## How to run
+
+```bash
+# 1. Install dependencies (Python 3.12+, Node.js 20+, AgentCore CLI 0.30.0)
+pip install -r requirements.txt
+pip install uv
+npm install -g @aws/agentcore@0.30.0
+
+# 2. Deploy infrastructure/starter_stack.yaml as stack "udacity-agentcore" (us-east-1), then:
+python infrastructure/seed_data.py
+python config.py
+
+# 3. Create the 3 Knowledge Bases in the console and add their IDs to .env
+
+# 4. Deploy (guardrail, runtime, memory, observability) and copy the printed values to .env
+python src/agent_orchestrator.py deploy
+
+# 5. Test
+python tests/test_agent.py all
+python src/agent_orchestrator.py test
+python src/agent_orchestrator.py chat     # interactive mode
+```
+
+---
+
 ## Design decisions
 
 - **Stateless workers:** each worker agent starts with an empty conversation for every call.
@@ -177,6 +237,8 @@ The map is small in the screenshot, so this list shows the same traces in a clea
   concurrent updates cannot overwrite each other.
 - **Fail-safe tools:** tools return clear "not found" messages instead of crashing, and the
   agents are told never to invent data.
+- **Test the guardrail, not only create it:** a guardrail that is too strict breaks normal
+  requests. Every new version is checked with allowed and blocked examples before it is published.
 - **Less personal data:** customer email and phone are not sent to the agents, and the guardrail
   also anonymizes them.
 - **Cost control:** Haiku 4.5 handles routing (fast and cheap) and Sonnet 4.5 handles reasoning.
