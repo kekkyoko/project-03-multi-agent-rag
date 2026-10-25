@@ -1,253 +1,100 @@
-# NovaMart Multi-Agent Customer Support System
+# NovaMart Multi-Agent Customer Support
 
 **Udacity – Capstone Project 3.3: Enterprise Multi-Agent Architecture with Amazon Bedrock AgentCore**
 
-This project is a multi-agent customer support system for NovaMart, a fictional online store.
-It uses the **Strands Agents SDK**, **Amazon Bedrock** and **Amazon Bedrock AgentCore**.
-The system reads a customer request, sends it to the right specialist agent, finds information
-in DynamoDB and in three Bedrock Knowledge Bases, and writes a final answer for the customer.
-It also has safety guardrails, session memory, and full tracing with CloudWatch and X-Ray.
+A customer support system with 5 Strands agents (Orchestrator → Inventory, Policy, Refund,
+Communication). The PolicyAgent runs 3 retriever sub-agents **in parallel**, one per Bedrock
+Knowledge Base. The system runs on AgentCore Runtime with a Bedrock Guardrail, AgentCore Memory,
+CloudWatch logs and X-Ray tracing.
 
----
-
-## Results
-
-| Check | Result |
-|---|---|
-| Automated test suite (`python tests/test_agent.py all`) | **120 / 120** |
-| X-Ray Service Map | Full call chain: Orchestrator → worker agents → Knowledge Bases |
-
-![Test suite score](screenshots/test/test_all.png)
+**Result: 120 / 120 in `python tests/test_agent.py all`**
 
 ---
 
 ## Submission files
 
-| File | Description |
+| File | Content |
 |---|---|
-| `src/agent_orchestrator.py` | Completed implementation (Tasks 2, 3, 4 and 6) |
-| `.env` | Knowledge Base IDs, AgentCore Runtime ARN and Guardrail ID/version (no AWS credentials) |
-| `fix_guardrail.py` | Helper script that tests the guardrail and publishes a new version (see Task 3) |
-| `screenshots/test_score.png` | Test suite result: 120/120 |
-| `screenshots/xray_service_map.png` | X-Ray Service Map after `python src/agent_orchestrator.py test` |
-| `screenshots/xray_traces_list.png` | X-Ray trace list for the same run (easier to read than the map) |
+| `src/agent_orchestrator.py` | Completed code (Tasks 2, 3, 4, 6) |
+| `.env` | KB IDs, Runtime ARN, Guardrail ID and version (no AWS credentials) |
+| `fix_guardrail.py` | Helper that tests the guardrail and publishes a new version |
+| `screenshots/` | All screenshots (see below) |
 
 ---
 
-## Architecture
+## 1. Test suite – 120/120
 
-```
-Customer Request
-      │
-OrchestratorAgent  (Claude Haiku 4.5, temperature 0.0)
-      │
-   ┌──┴───────────────┬──────────────────┬────────────────────┐
-   │                  │                  │                    │
-InventoryAgent    PolicyAgent        RefundAgent      CommunicationAgent
-(DynamoDB)        (multi-agent RAG)  (DynamoDB)       (final answer)
-                      │
-      ┌───────────────┼────────────────┐
-ReturnsRetriever  ShippingRetriever  WarrantyRetriever
-(Returns KB)      (Shipping KB)      (Warranty KB)
-      └──────── run in PARALLEL ────────┘
-
-Shared state: DynamoDB WorkflowState table (optimistic locking)
-```
-
-| Agent | Model | Temperature | Tools |
-|---|---|---|---|
-| OrchestratorAgent | Claude Haiku 4.5 (`config.ORCHESTRATOR_MODEL_ID`) | 0.0 | `initialize_session`, `route_to_inventory_agent`, `route_to_policy_agent`, `route_to_refund_agent`, `route_to_communication_agent` |
-| InventoryAgent | Claude Sonnet 4.5 (`config.WORKER_MODEL_ID`) | 0.1 | `check_order_status`, `get_customer_tier`, `list_customer_orders` |
-| RefundAgent | Claude Sonnet 4.5 | 0.1 | `get_inventory_context`, `initiate_refund` |
-| PolicyAgent | Claude Sonnet 4.5 | 0.2 | `search_all_policies` |
-| 3 × PolicyRetrieverAgent | Claude Sonnet 4.5 | 0.0 | one KB retrieval tool each |
-| CommunicationAgent | Claude Sonnet 4.5 | 0.3 | `get_full_workflow_context` |
-
-All model IDs come from `config.py`. No model ID is hardcoded.
-
----
-
-## What I implemented
-
-### Task 2 – Multi-agent graph
-
-- **InventoryAgent** only collects facts and never decides eligibility. `check_order_status` uses
-  the composite key of the Orders table (`customer_id` + `order_id`) and also returns
-  `days_since_order`. `get_customer_tier` returns the tier and the return window
-  (Standard = 30 days, Premium = 60 days). It does not return email or phone, so less personal
-  data moves between agents.
-- **RefundAgent** always reads the InventoryAgent facts from WorkflowState first. Then it
-  applies the window for the customer tier (30 or 60 days) and checks the order status.
-  Only when the order is eligible does it call `initiate_refund`. This tool updates the order in
-  DynamoDB (`status = return_requested`) and creates a return reference (`RET-XXXXXXXX`).
-- **PolicyAgent (multi-agent RAG)** creates three retriever sub-agents:
-  `ReturnsPolicyRetrieverAgent`, `ShippingPolicyRetrieverAgent` and `WarrantyPolicyRetrieverAgent`.
-  Each one calls `retrieve_from_knowledge_base()` with its own KB ID. The `search_all_policies`
-  tool runs the three retrievers **in parallel** with `ThreadPoolExecutor(max_workers=3)` and
-  `as_completed()`, and then merges the results in a fixed order (Returns, Shipping, Warranty).
-- **CommunicationAgent** reads the full WorkflowState and writes a warm, professional
-  answer. It uses only the facts found by the other agents.
-- **OrchestratorAgent** follows the six routing rules:
-  1. Always call `initialize_session` first.
-  2. Order / return / refund → InventoryAgent, then RefundAgent.
-  3. Policy questions → PolicyAgent.
-  4. Account questions ("what is my tier?") → InventoryAgent, never PolicyAgent.
-  5. Math questions → the orchestrator calculates by itself (rounding only at the end) and
-     does not call Inventory, Policy or Refund.
-  6. Always call `route_to_communication_agent` as the **last** step. The orchestrator never
-     writes the final answer itself.
-
-  Every routing tool follows the same pattern: **read WorkflowState → run the worker → write the
-  result with `_update_workflow_state()` and the `expected_version` read before the call**
-  (optimistic locking).
-
-### Task 3 – Guardrail and AgentCore Runtime
-
-- `create_guardrail()` creates `udacity-agentcore-guardrail` with:
-  - Content filters: SEXUAL, VIOLENCE, HATE = HIGH; INSULTS, MISCONDUCT = MEDIUM.
-  - PII: credit card numbers and SSNs = BLOCK; email and phone = ANONYMIZE.
-  - Denied topics (Standard tier + `us.guardrail.v1:0` cross-region profile): competitor
-    products, pricing negotiations and legal threats. "Pricing negotiations" is defined as
-    haggling or asking to change an advertised price, so a normal calculation with a given price
-    and discount (the math scenario) is still allowed.
-  - Managed profanity word list.
-  - A published, numbered version (`create_guardrail_version()`), not DRAFT.
-  - The settings live in one helper, `guardrail_settings()`, so the code and the deployed
-    guardrail always match. If the guardrail already exists, `create_guardrail()` returns the
-    **latest** published version.
-
-#### Guardrail validation (false positive found and fixed)
-
-During the end-to-end test, the math scenario was blocked: the guardrail answered with its
-"Sorry, I can't help with that request" message. I used `ApplyGuardrail` to check which policy
-blocked it. The cause was the `pricing_negotiations` topic: the word "discount" made the
-question look like haggling.
-
-The fix followed the AWS guidance for denied topics: describe the topic in a precise and
-positive way, with no exceptions inside the definition. The new definition is
-*"Customer attempts to haggle or bargain with NovaMart, or asks NovaMart to lower, match, or
-change the price it advertises for a product."*
-
-The helper script `fix_guardrail.py` updates the DRAFT, tests it, and publishes a new numbered
-version **only if all checks pass**:
-
-| Test sentence | Expected | Result |
-|---|---|---|
-| "How much would 5 items at $29.99 be with a 10% discount?" (input) | allowed | allowed |
-| Math answer with the total $134.96 (output) | allowed | allowed |
-| "I want to return my order ORD-27176" | allowed | allowed |
-| "What is the return policy for premium customers?" | allowed | allowed |
-| "Can you lower the price of these headphones for me?" | blocked | blocked |
-| "Is Amazon cheaper than NovaMart for this laptop?" | blocked | blocked |
-| "I'm going to sue NovaMart if you don't refund me." | blocked | blocked |
-
-After publishing the new version, I updated `GUARDRAIL_VERSION` in `.env`, redeployed the
-runtime, and confirmed that the math question returns **$134.96**.
-- `deploy_to_agentcore_runtime()` sets the runtime environment variables (region, project name,
-  3 KB IDs, log group, guardrail ID and version), then calls
-  `agentcore_cli.configure_runtime(network_mode='PUBLIC', protocol='HTTP', execution_role_arn=config.AGENTCORE_ROLE_ARN)`,
-  `agentcore_cli.deploy()` and `agentcore_cli.deployed_runtime_arn()`.
-  The provided `_apply_guardrail()` attaches the guardrail to every agent model.
-
-  ![CUST-003](screenshots/cust/CUST-003.png)
-
-
-### Task 4 – Memory
-
-- `configure_memory()` calls `create_memory()` with a `summaryMemoryStrategy`
-  (SESSION_SUMMARY), `eventExpiryDuration=7`, a name, a description and a `clientToken`.
-
-### Task 5 – Knowledge Bases (AWS Console)
-
-Three self-managed Knowledge Bases, all with the **Titan Text Embeddings V2** model and the
-**S3 Vectors** bucket created by the CloudFormation stack:
-
-| Knowledge Base | S3 prefix | Vector index |
-|---|---|---|
-| `novamart-returns-kb` | `policies/returns/` | `returns-policy-index` |
-| `novamart-shipping-kb` | `policies/shipping/` | `shipping-policy-index` |
-| `novamart-warranty-kb` | `policies/warranty/` | `warranty-policy-index` |
-
-Each data source was synced, and the three KB IDs are in `.env`.
-
-### Task 6 – Observability
-
-- `configure_observability()` builds a `loggingConfiguration`:
-  - CloudWatch: `config.AGENT_LOG_GROUP`, log level INFO, enabled.
-  - X-Ray: enabled, `samplingRate = 1.0` (100% for development).
-
-  It passes this dict to `apply_observability_config()` inside `try/except`.
-
----
-
-## End-to-end test (Task 7)
-
-`python src/agent_orchestrator.py test` runs three scenarios. The X-Ray traces show the expected
-routing:
-
-| Scenario | Expected routing |
+| Screenshot | Shows |
 |---|---|
-| "I want to return my wireless headphones from order ORD-27176" (CUST-001) | Orchestrator → Inventory → Refund → Communication |
-| "What is the return policy for premium customers?" (CUST-002) | Orchestrator → Policy (3 parallel KB retrievers) → Communication |
-| "How much would 5 items at $29.99 be with a 10% discount?" (CUST-003) | Orchestrator → Communication only (answer: $134.96) |
+| `screenshots/test_agent/phase2-4.png` | Tasks 2, 3 and 4 pass |
+| `screenshots/test_agent/phase5a.png`, `phase5b.png` | Task 5: 3 KBs ACTIVE, Titan v2, synced, parallel retrieval returns passages from all 3 KBs |
+| `screenshots/test_agent/phase6.png` | Task 6 passes and the final score **120/120** |
+
+![Score](screenshots/test_agent/phase6.png)
+
+---
+
+## 2. `python src/agent_orchestrator.py test` – 3 scenarios + X-Ray
+
+Each scenario prints `X-Ray trace ... published successfully`.
+
+| Scenario | Routing | Screenshots |
+|---|---|---|
+| CUST-001: "I want to return my wireless headphones from order ORD-27176" | Orchestrator → Inventory → Refund → Communication | `screenshots/CUST-001/1.png` – `4.png`, map: `map1.png` |
+| CUST-002: "What is the return policy for premium customers?" | Orchestrator → Policy (3 KB retrievers in parallel) → Communication | `screenshots/CUST-002/1.png` – `6.png`, map: `map.png` |
+| CUST-003: "How much would 5 items at $29.99 be with a 10% discount?" | Orchestrator calculates ($134.96) → Communication | `screenshots/CUST-003/1.png` – `2.png`, map: `map.png` |
+
+Note for CUST-001: the order had already been returned in an earlier run, so the RefundAgent
+correctly answered that the return is already in progress (reference `RET-E0EC7D52`) and did not
+create a second one.
 
 ### X-Ray Service Map
 
-![X-Ray Service Map](screenshots/x-ray/map.png)
+`NovaMart-Orchestrator` is connected to `InventoryAgent`, `RefundAgent`, `PolicyAgent`,
+`CommunicationAgent` and the 3 Knowledge Base nodes (`KnowledgeBase:returns`, `:shipping`,
+`:warranty`).
 
-### X-Ray trace list
-
-The map is small in the screenshot, so this list shows the same traces in a clearer way.
-
-![X-Ray trace list](screenshots/x-ray/list.png)
+![X-Ray Service Map](screenshots/CUST-002/map.png)
 
 ---
 
-## How to run
+## 3. Knowledge Bases (Task 5)
 
-```bash
-# 1. Install dependencies (Python 3.12+, Node.js 20+, AgentCore CLI 0.30.0)
-pip install -r requirements.txt
-pip install uv
-npm install -g @aws/agentcore@0.30.0
+| Knowledge Base | ID | S3 prefix | Vector store | Vector index |
+|---|---|---|---|---|
+| `novamart-returns-kb` | `YTAKMTVDEI` | `policies/returns/` | S3 Vectors (stack VectorStoreBucket) | `returns-policy-index` |
+| `novamart-shipping-kb` | `QORQB9ZL6P` | `policies/shipping/` | S3 Vectors (stack VectorStoreBucket) | `shipping-policy-index` |
+| `novamart-warranty-kb` | `TARQWNEBAC` | `policies/warranty/` | S3 Vectors (stack VectorStoreBucket) | `warranty-policy-index` |
 
-# 2. Deploy infrastructure/starter_stack.yaml as stack "udacity-agentcore" (us-east-1), then:
-python infrastructure/seed_data.py
-python config.py
+All three use `amazon.titan-embed-text-v2:0`, and each data source was synced.
 
-# 3. Create the 3 Knowledge Bases in the console and add their IDs to .env
-
-# 4. Deploy (guardrail, runtime, memory, observability) and copy the printed values to .env
-python src/agent_orchestrator.py deploy
-
-# 5. Test
-python tests/test_agent.py all
-python src/agent_orchestrator.py test
-python src/agent_orchestrator.py chat     # interactive mode
-```
+| Screenshot | Shows |
+|---|---|
+| `screenshots/kbs.png` | The 3 Knowledge Bases, status Available |
+| `screenshots/index.png` | The 3 vector indexes created by the CloudFormation stack |
+| `screenshots/kb/returns_store.png`, `shipping_store.png`, `warranty_store.png` | Embedding model, S3 Vectors bucket and index of each KB |
+| `screenshots/kb/returns_sync.png`, `shipping_sync.png`, `warranty_sync.png` | Data source of each KB with a completed sync |
 
 ---
 
-## Design decisions
+## Implementation summary
 
-- **Stateless workers:** each worker agent starts with an empty conversation for every call.
-  All shared context goes through the DynamoDB WorkflowState, so one session cannot leak
-  into another session.
-- **Optimistic locking:** every write uses the `version` read before the worker ran, so
-  concurrent updates cannot overwrite each other.
-- **Fail-safe tools:** tools return clear "not found" messages instead of crashing, and the
-  agents are told never to invent data.
-- **Test the guardrail, not only create it:** a guardrail that is too strict breaks normal
-  requests. Every new version is checked with allowed and blocked examples before it is published.
-- **Less personal data:** customer email and phone are not sent to the agents, and the guardrail
-  also anonymizes them.
-- **Cost control:** Haiku 4.5 handles routing (fast and cheap) and Sonnet 4.5 handles reasoning.
-  The parallel retrieval also reduces the time of policy questions.
+- **Task 2:** InventoryAgent only reports facts (Orders table composite key, tier and return
+  window). RefundAgent reads them from WorkflowState and applies 30 days (Standard) or 60 days
+  (Premium). PolicyAgent runs 3 retriever agents with `ThreadPoolExecutor(max_workers=3)` +
+  `as_completed()`. The Orchestrator (Haiku 4.5, temperature 0.0) follows the 6 routing rules
+  and always calls CommunicationAgent last. Every routing tool reads WorkflowState, runs the
+  worker, and writes the result with optimistic locking (`expected_version`).
+- **Task 3:** Guardrail with content filters (HIGH/MEDIUM), PII (block cards and SSNs,
+  anonymize email and phone), 3 denied topics (Standard tier), profanity list, and a numbered
+  version. Deployed with the AgentCore CLI (PUBLIC, HTTP, stack execution role, KB and
+  guardrail environment variables).
+- **Task 4:** AgentCore Memory with `summaryMemoryStrategy` and `eventExpiryDuration=7`.
+- **Task 6:** `loggingConfiguration` (CloudWatch INFO + X-Ray `samplingRate=1.0`) applied with
+  `apply_observability_config()` inside `try/except`.
 
----
-
-## Notes
-
-- `.env` contains only resource IDs. It does not contain AWS credentials.
-- After the review, all resources are removed with:
-  `python infrastructure/cleanup.py --yes --disable-transaction-search`
+**Guardrail fix:** the first guardrail blocked the math scenario because the word "discount"
+matched the `pricing_negotiations` topic. I made the topic definition more precise (haggling or
+asking NovaMart to change an advertised price). `fix_guardrail.py` tested 7 sentences (math,
+return and policy questions allowed; negotiation, competitor and legal threat blocked) and
+published a new version only after all checks passed.
