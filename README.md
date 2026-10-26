@@ -1,5 +1,16 @@
 # NovaMart Multi-Agent Customer Support
 
+## What This Project Does
+
+NovaMart is a multi-agent AI customer support system designed for an online store. It uses specialized AI agents to handle different types of customer requests, including:
+- Order inquiries: Helping customers check order information and status.
+- Returns and refunds: Assisting with return-related questions and requests.
+- Store policies: Retrieving relevant information from a knowledge base using Retrieval-Augmented Generation (RAG).
+- Customer support: Coordinating multiple agents to provide responses based on the user's request.
+- 
+---
+
+The project uses Amazon Bedrock AgentCore to support agent orchestration and integrates tools for memory, security, and observability.
 **Udacity – Capstone Project 3.3: Enterprise Multi-Agent Architecture with Amazon Bedrock AgentCore**
 
 A customer support system with 5 Strands agents (Orchestrator → Inventory, Policy, Refund,
